@@ -1,0 +1,12 @@
+# Python compiled files
+__pycache__/
+*.pyc
+*.pyo
+
+# Application build artifacts
+build/
+dist/
+*.spec
+
+# Database file (if it contains dynamic user data and shouldn't be committed)
+global_energy_db.sqlite
