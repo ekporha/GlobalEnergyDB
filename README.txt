@@ -31,7 +31,5 @@ Requirements:
 - No installation needed.
 - Works on Windows 10 or later.
 
-Support:
---------
-For any questions or support, contact: support@globalenergydemo.app
+
 
