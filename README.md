@@ -17,21 +17,19 @@ This is a desktop application built with Python and Tkinter for managing a datab
 
 ## Screenshots
 
-*(You can add screenshots of your application here to make the README more engaging)*
 Example:
-![Application Main Window](path/to/your/screenshot.png)
+![Application Main Window]
+![image](https://github.com/user-attachments/assets/4d452a36-a50a-48c2-8866-ba905096abd3)
+
 
 ## Setup and Installation
-
 Follow these steps to get the application running on your Windows machine.
 
 ### 1. Prerequisites
-
 * **Python 3.x:** Download and install Python from [python.org](https://www.python.org/downloads/windows/).
     * **IMPORTANT:** During installation, ensure you **check the "Add python.exe to PATH"** option.
 
 ### 2. Clone the Repository
-
 First, clone this repository to your local machine:
 
 ```bash
