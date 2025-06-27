@@ -6,6 +6,8 @@ import webbrowser
 import csv
 import datetime
 from urllib.parse import quote
+import threading # For running LLM calls in a separate thread to keep UI responsive
+import re # For simple keyword extraction
 
 # --- Attempt to import optional libraries ---
 try:
@@ -28,41 +30,96 @@ except ImportError:
     print("PyPDF2 not found. PDF import functionality will be limited. Install with 'pip install PyPDF2'")
 
 # --- Gemini AI Integration ---
+import base64 # base64 is a standard library, no need for try-except here
+try:
+    from Crypto.Cipher import AES # Import AES for decryption
+    AES_AVAILABLE = True
+except ImportError:
+    AES_AVAILABLE = False
+    print("PyCryptodome library not found. Secure API key loading will be disabled. Install with 'pip install pycryptodome'")
+
 try:
     import google.generativeai as genai
-    # Configure your Gemini API key
-    # It's highly recommended to use an environment variable for your API key
-    # e.g., os.environ.get("GEMINI_API_KEY")
-    # For demonstration, you might hardcode it, but AVOID THIS IN PRODUCTION
-    genai.configure(api_key="YOUR_GEMINI_API_KEY") # Replace with your actual API key
-    GEMINI_AVAILABLE = True
-    print("Gemini AI API configured.")
+    GEMINI_API_KEY_LOADED = False # Flag to track if API key was loaded successfully
+    if AES_AVAILABLE:
+        try:
+            # Key for AES encryption (must be 16 bytes for AES-128, 24 for AES-192, 32 for AES-256)
+            # This secret must match the one used in encrypt_key.py
+            SECRET_KEY = b'mysecretaeskey12'
+
+            def unpad(s): return s.rstrip(b' ') # Define unpad function
+
+            def load_encrypted_api_key():
+                with open("encrypted_key.txt", "r") as f:
+                    encrypted = base64.b64decode(f.read())
+                cipher = AES.new(SECRET_KEY, AES.MODE_ECB)
+                decrypted = unpad(cipher.decrypt(encrypted))
+                return decrypted.decode()
+
+            gemini_api_key = load_encrypted_api_key()
+            genai.configure(api_key=gemini_api_key)
+            GEMINI_AVAILABLE = True
+            GEMINI_API_KEY_LOADED = True
+            print("Gemini AI API configured securely from encrypted_key.txt.")
+        except FileNotFoundError:
+            GEMINI_AVAILABLE = False
+            print("encrypted_key.txt not found. Please run encrypt_key.py first.")
+        except Exception as e:
+            GEMINI_AVAILABLE = False
+            print(f"Error loading Gemini API key from file: {e}")
+    else:
+        GEMINI_AVAILABLE = False
+        print("PyCryptodome is not available, cannot load encrypted API key.")
+
 except ImportError:
     GEMINI_AVAILABLE = False
     print("Google Generative AI library not found. Gemini AI features will be disabled. Install with 'pip install google-generativeai'")
 except Exception as e:
+    # This catches errors from genai.configure if key is invalid even if loaded from file
     GEMINI_AVAILABLE = False
     print(f"Error configuring Gemini AI: {e}. Gemini AI features will be disabled.")
 
 
-def gemini_web_search(query):
+def get_gemini_model():
+    """Returns a configured Gemini GenerativeModel if available."""
+    if not GEMINI_AVAILABLE or not GEMINI_API_KEY_LOADED:
+        return None
+    try:
+        return genai.GenerativeModel('gemini-1.5-flash')
+    except Exception as e:
+        # Using print for console output, as messagebox might block in a thread
+        print(f"Gemini AI Error: Failed to load Gemini model: {e}")
+        return None
+
+# Removed gemini_web_search as it's no longer used for direct browser opening
+# The functions that previously called it will now use webbrowser directly.
+
+def gemini_chat_response(user_query, context):
     """
-    Performs a web search using the Gemini AI Agent and returns a summary of the results.
+    Generates a chatbot response using Gemini AI, based on user query and provided context.
+    If the answer is not in context, it will suggest a web search with a special tag.
     """
-    if not GEMINI_AVAILABLE:
-        messagebox.showerror("Gemini AI Error", "Gemini AI library not available or configured.")
-        return "Gemini AI is not available."
+    model = get_gemini_model()
+    if not model:
+        return "Chatbot is currently unavailable: Gemini AI not configured."
 
     try:
-        model = genai.GenerativeModel('gemini-pro')
-        # Using a conversational model to simulate a search agent interaction
+        # Prompt for Retrieval Augmented Generation (RAG)
+        # Instruct the LLM to provide a web search suggestion if context is insufficient.
+        prompt = f"You are a helpful assistant providing information about global energy data. " \
+                 f"Answer the following question concisely based ONLY on the provided context about producers. " \
+                 f"If the answer is not available in the context, respond with: " \
+                 f"'I don't have that specific information in my database. You might find it by searching online. [WEB_SEARCH_SUGGESTION: {user_query} global energy]' " \
+                 f"Otherwise, provide the answer directly from the context. " \
+                 f"\n\nContext:\n{context}\n\nQuestion: {user_query}"
+
         chat = model.start_chat(history=[])
-        response = chat.send_message(f"Please perform a web search for: {query}. Provide a concise summary of the top results.")
-        # Assuming the response text contains the summarized search results
+        response = chat.send_message(prompt)
         return response.text
     except Exception as e:
-        messagebox.showerror("Gemini AI Error", f"Failed to perform Gemini AI search: {e}")
-        return "Error during Gemini AI search."
+        print(f"Gemini AI Error in chatbot response: {e}")
+        return "I'm sorry, I encountered an error while processing your request. Please try again."
+
 
 # --- Database Setup ---
 DB_FILE = "global_energy_db.sqlite"
@@ -140,7 +197,7 @@ def producer_exists(name):
     return cursor.fetchone() is not None
 
 def add_producer():
-    """Adds a new producer record to the database."""
+    """Adds a new producer record to the database with optional AI suggestions."""
     name = entry_name.get().strip()
     contact = entry_contact.get().strip()
     address = entry_address.get().strip()
@@ -154,6 +211,44 @@ def add_producer():
     if producer_exists(name):
         messagebox.showwarning("Duplicate Entry", f"A producer with the name '{name}' already exists.")
         return
+
+    # AI suggestion for category/products
+    if GEMINI_AVAILABLE and (not category or not products):
+        model = get_gemini_model()
+        if model:
+            try:
+                # Prompt to get suggestions for category and products based on name/contact/address
+                ai_prompt = f"Given the producer name '{name}', contact '{contact}', and address '{address}', " \
+                            f"suggest a suitable category (e.g., 'Solar', 'Wind', 'Hydro', 'Biofuel', 'Geothermal', 'Nuclear', 'Fossil Fuel') " \
+                            f"and representative products. Format as 'Category: [category], Products: [product1, product2]'. If no information is sufficient, state 'Category: Unknown, Products: None'."
+                response = model.start_chat(history=[]).send_message(ai_prompt)
+                suggestion_text = response.text.strip()
+                print(f"AI Suggestion: {suggestion_text}") # For debugging
+
+                # Parse the suggestion
+                suggested_category = "Unknown"
+                suggested_products = "None"
+
+                if "Category:" in suggestion_text and "Products:" in suggestion_text:
+                    parts = suggestion_text.split("Category:")
+                    if len(parts) > 1:
+                        category_part = parts[1].split("Products:")[0].strip().replace(",", "")
+                        suggested_category = category_part.strip()
+
+                        products_part = suggestion_text.split("Products:")[1].strip()
+                        suggested_products = products_part.strip()
+
+
+                if suggested_category != "Unknown" or suggested_products != "None":
+                    if messagebox.askyesno("AI Suggestion",
+                                            f"AI suggests:\nCategory: {suggested_category}\nProducts: {suggested_products}\n\nDo you want to apply these suggestions?"):
+                        if not category and suggested_category != "Unknown":
+                            category = suggested_category
+                        if not products and suggested_products != "None":
+                            products = suggested_products
+
+            except Exception as e:
+                messagebox.showwarning("AI Suggestion Error", f"Failed to get AI suggestions: {e}")
 
     try:
         cursor.execute("INSERT INTO producers (name, contact, address, products, category) VALUES (?, ?, ?, ?, ?)",
@@ -189,6 +284,22 @@ def update_producer():
         messagebox.showwarning("Duplicate Entry", f"A producer with the name '{name}' already exists. Cannot update to a duplicate name.")
         return
 
+    # Optional: AI validation/enrichment for updates
+    if GEMINI_AVAILABLE:
+        model = get_gemini_model()
+        if model:
+            try:
+                # Simple AI validation/suggestion for updated fields
+                ai_prompt = f"Review the following producer data for potential issues or suggestions: " \
+                            f"Name: {name}, Contact: {contact}, Address: {address}, Products: {products}, Category: {category}. " \
+                            f"Provide a brief assessment or suggest improvements if any. If no issues, state 'No issues found'."
+                response = model.start_chat(history=[]).send_message(ai_prompt)
+                ai_assessment = response.text.strip()
+                if ai_assessment and ai_assessment != "No issues found.":
+                    messagebox.showinfo("AI Assessment", f"AI reviewed the update:\n\n{ai_assessment}")
+            except Exception as e:
+                messagebox.showwarning("AI Assessment Error", f"Failed to get AI assessment: {e}")
+
     try:
         cursor.execute("UPDATE producers SET name=?, contact=?, address=?, products=?, category=? WHERE id=?",
                        (name, contact, address, products, category, producer_id))
@@ -200,15 +311,34 @@ def update_producer():
         messagebox.showerror("Database Error", f"Failed to update producer: {e}")
 
 def delete_producer():
-    """Deletes the selected producer record from the database."""
+    """Deletes the selected producer record from the database with AI confirmation."""
     selected_item = tree_producers.selection()
+    print(f"Delete function - selected_item: {selected_item}") # Debugging print
     if not selected_item:
         messagebox.showwarning("Selection Error", "Please select a producer to delete.")
         return
 
     producer_id = tree_producers.item(selected_item, 'values')[0]
+    producer_name = tree_producers.item(selected_item, 'values')[1]
 
-    if messagebox.askyesno("Confirm Delete", f"Are you sure you want to delete producer ID {producer_id}?"):
+    ai_confirmation_message = ""
+    if GEMINI_AVAILABLE:
+        model = get_gemini_model()
+        if model:
+            try:
+                # Ask AI for a more 'intelligent' confirmation prompt
+                ai_prompt = f"Generate a brief confirmation message for deleting the producer '{producer_name}' (ID: {producer_id}). " \
+                            f"Emphasize that the action is irreversible. Keep it concise, around one sentence."
+                response = model.start_chat(history=[]).send_message(ai_prompt)
+                ai_confirmation_message = response.text.strip()
+            except Exception as e:
+                print(f"AI confirmation prompt failed: {e}") # Log error, proceed with default confirmation
+                ai_confirmation_message = ""
+
+    if not ai_confirmation_message:
+        ai_confirmation_message = f"Are you sure you want to delete producer '{producer_name}' (ID: {producer_id})?"
+
+    if messagebox.askyesno("Confirm Delete", ai_confirmation_message + "\n\nThis action cannot be undone."):
         try:
             cursor.execute("DELETE FROM producers WHERE id=?", (producer_id,))
             conn.commit()
@@ -218,12 +348,19 @@ def delete_producer():
         except sqlite3.Error as e:
             messagebox.showerror("Database Error", f"Failed to delete producer: {e}")
 
+
 def on_producer_tree_select(event):
     """Populates input fields when a row in the Producer Treeview is selected."""
     selected_item = tree_producers.selection()
+    print(f"Treeview selection event - selected_item: {selected_item}") # Debugging print
     if selected_item:
         values = tree_producers.item(selected_item, 'values')
-        clear_producer_fields()
+        # IMPORTANT: Removed clear_producer_fields() from here to prevent immediate deselection
+        entry_name.delete(0, tk.END)
+        entry_contact.delete(0, tk.END)
+        entry_address.delete(0, tk.END)
+        entry_products.delete(0, tk.END)
+        entry_category.delete(0, tk.END)
         entry_name.insert(0, values[1])
         entry_contact.insert(0, values[2])
         entry_address.insert(0, values[3])
@@ -260,16 +397,17 @@ def web_search_producer():
 
 def web_search_product_keyword():
     """
-    Performs a general web search for companies producing a given product keyword using Gemini AI.
+    Performs a general web search for companies producing a given product keyword
+    by opening a new browser tab with a Google search.
     """
     keyword = entry_web_search_keyword.get().strip()
     if not keyword:
         messagebox.showwarning("Input Error", "Please enter a keyword for product web search.")
         return
 
-    search_query = f"companies producing {keyword}"
-    gemini_result = gemini_web_search(search_query)
-    messagebox.showinfo("Gemini AI Search Result", f"Gemini AI Search for '{search_query}':\n\n{gemini_result}")
+    search_query = f"companies producing {keyword} energy"
+    webbrowser.open_new_tab(f"https://www.google.com/search?q={quote(search_query)}")
+    messagebox.showinfo("Web Search Initiated", f"Opening web search for '{search_query}' in your browser.")
 
 
 def export_to_csv():
@@ -547,7 +685,7 @@ def upload_and_scan_file_for_energy_products():
         return
 
     keyword_dialog = tk.Toplevel(root)
-    keyword_dialog.title("Select Keyword to Search (AI-Powered)") # Updated title
+    keyword_dialog.title("Select Keyword to Search (Google Search)") # Updated title
     keyword_dialog.transient(root)
     keyword_dialog.grab_set()
     keyword_dialog.geometry("400x200")
@@ -566,13 +704,13 @@ def upload_and_scan_file_for_energy_products():
         final_keyword = entry_custom_keyword.get().strip() or keyword_var.get().strip()
         if final_keyword:
             search_query = f"{final_keyword} global energy product suppliers" # Refined query for AI search
-            gemini_result = gemini_web_search(search_query)
-            messagebox.showinfo("Gemini AI Search Result", f"Gemini AI Search for '{search_query}':\n\n{gemini_result}", parent=keyword_dialog)
+            webbrowser.open_new_tab(f"https://www.google.com/search?q={quote(search_query)}")
+            messagebox.showinfo("Web Search Initiated", f"Opening web search for '{search_query}' in your browser.", parent=keyword_dialog)
             keyword_dialog.destroy()
         else:
             messagebox.showwarning("Input Required", "Please enter or select a keyword to search.", parent=keyword_dialog)
 
-    tk.Button(keyword_dialog, text="Search Online (Gemini AI)", command=confirm_and_search).pack(pady=15) # Updated button text
+    tk.Button(keyword_dialog, text="Search Online (Google Search)", command=confirm_and_search).pack(pady=15) # Updated button text
 
     keyword_dialog.update_idletasks()
     x = root.winfo_x() + (root.winfo_width() // 2) - (keyword_dialog.winfo_width() // 2)
@@ -580,11 +718,294 @@ def upload_and_scan_file_for_energy_products():
     keyword_dialog.geometry(f"+{x}+{y}")
 
 
+# --- AI Database Query Function ---
+def ai_database_query():
+    """Allows user to query the database using natural language via Gemini AI."""
+    model = get_gemini_model()
+    if not model:
+        messagebox.showerror("Gemini AI Error", "Gemini AI library not available or configured.")
+        return
+
+    query_dialog = tk.Toplevel(root)
+    query_dialog.title("AI Database Query")
+    query_dialog.transient(root)
+    query_dialog.grab_set()
+    query_dialog.geometry("600x400")
+
+    tk.Label(query_dialog, text="Enter your natural language query about producers:").pack(padx=20, pady=10)
+    query_entry = tk.Entry(query_dialog, width=80)
+    query_entry.pack(padx=20, pady=5)
+
+    result_text = tk.Text(query_dialog, height=10, width=75, state='disabled', wrap='word')
+    result_text.pack(padx=20, pady=10)
+    result_scroll = tk.Scrollbar(query_dialog, command=result_text.yview)
+    result_scroll.pack(side="right", fill="y")
+    result_text.config(yscrollcommand=result_scroll.set)
+
+    # Define table schema for AI
+    db_schema = {
+        "producers": {
+            "columns": ["id", "name", "contact", "address", "products", "category"],
+            "description": "Stores information about global energy producers including their name, contact details, address, products they offer, and their energy category (e.g., Solar, Wind, Hydro, Biofuel, Geothermal, Nuclear, Fossil Fuel)."
+        }
+    }
+
+    def execute_ai_query():
+        user_query = query_entry.get().strip()
+        if not user_query:
+            messagebox.showwarning("Input Error", "Please enter a query.")
+            return
+
+        result_text.config(state='normal')
+        result_text.delete(1.0, tk.END)
+        result_text.insert(tk.END, "Thinking...\n")
+        result_text.config(state='disabled')
+        query_dialog.update_idletasks()
+
+        def run_query_in_thread():
+            try:
+                # Step 1: Use AI to generate SQL
+                prompt = f"Given the SQLite database schema:\n\n" \
+                         f"CREATE TABLE producers (\n" \
+                         f"    id INTEGER PRIMARY KEY AUTOINCREMENT,\n" \
+                         f"    name TEXT NOT NULL UNIQUE,\n" \
+                         f"    contact TEXT,\n" \
+                         f"    address TEXT,\n" \
+                         f"    products TEXT,\n" \
+                         f"    category TEXT\n" \
+                         f");\n\n" \
+                         f"Table description: {db_schema['producers']['description']}\n\n" \
+                         f"Convert the following natural language query into a valid SQLite SQL SELECT statement. " \
+                         f"Only provide the SQL query, nothing else. Do not add any backticks or extra formatting. " \
+                         f"If the query cannot be translated to a SELECT statement, respond with 'INVALID_QUERY'.\n\n" \
+                         f"Natural language query: '{user_query}'\n\nSQL:"
+
+                response = model.start_chat(history=[]).send_message(prompt)
+                sql_query_raw = response.text.strip()
+                print(f"Generated SQL (raw): {sql_query_raw}") # For debugging
+
+                if sql_query_raw.upper().startswith("SELECT"):
+                    generated_sql = sql_query_raw
+                else:
+                    generated_sql = "INVALID_QUERY"
+
+                if generated_sql == "INVALID_QUERY":
+                    root.after(0, lambda: (
+                        result_text.config(state='normal'),
+                        result_text.delete(1.0, tk.END),
+                        result_text.insert(tk.END, "AI could not generate a valid SQL SELECT query from your input or it's not a SELECT query.\n"),
+                        result_text.config(state='disabled')
+                    ))
+                    return
+
+                # Step 2: Execute SQL query
+                temp_conn = sqlite3.connect(DB_FILE) # Use a new connection for the thread
+                temp_cursor = temp_conn.cursor()
+                temp_cursor.execute(generated_sql)
+                rows = temp_cursor.fetchall()
+                columns = [description[0] for description in temp_cursor.description]
+                temp_conn.close()
+
+                root.after(0, lambda: (
+                    result_text.config(state='normal'),
+                    result_text.delete(1.0, tk.END),
+                    result_text.insert(tk.END, "Query Results:\n"),
+                    result_text.insert(tk.END, "-" * 50 + "\n"),
+                    result_text.insert(tk.END, "\t".join(columns) + "\n"),
+                    result_text.insert(tk.END, "-" * 50 + "\n"),
+                    *(result_text.insert(tk.END, "\t".join(map(str, row)) + "\n") for row in rows),
+                    result_text.config(state='disabled')
+                ) if rows else (
+                    result_text.config(state='normal'),
+                    result_text.delete(1.0, tk.END),
+                    result_text.insert(tk.END, "No results found for your query.\n"),
+                    result_text.config(state='disabled')
+                ))
+
+            except sqlite3.Error as se:
+                root.after(0, lambda: (
+                    result_text.config(state='normal'),
+                    result_text.delete(1.0, tk.END),
+                    result_text.insert(tk.END, f"Database Error executing SQL: {se}\nGenerated SQL: {generated_sql}\n"),
+                    result_text.config(state='disabled')
+                ))
+            except Exception as e:
+                root.after(0, lambda: (
+                    result_text.config(state='normal'),
+                    result_text.delete(1.0, tk.END),
+                    result_text.insert(tk.END, f"AI/Execution Error: {e}\n"),
+                    result_text.config(state='disabled')
+                ))
+
+        # Run the AI query in a separate thread to prevent UI freezing
+        threading.Thread(target=run_query_in_thread).start()
+
+
+    tk.Button(query_dialog, text="Execute AI Query", command=execute_ai_query).pack(pady=10)
+
+    query_dialog.update_idletasks()
+    x = root.winfo_x() + (root.winfo_width() // 2) - (query_dialog.winfo_width() // 2)
+    y = root.winfo_y() + (root.winfo_height() // 2) - (query_dialog.winfo_height() // 2)
+    query_dialog.geometry(f"+{x}+{y}")
+
+
+# --- Chatbot Window Function ---
+def open_chatbot_window():
+    """Opens a new Toplevel window for the chatbot interface."""
+    chatbot_window = tk.Toplevel(root)
+    chatbot_window.title("GlobalEnergyDB Chatbot")
+    chatbot_window.geometry("500x600")
+    chatbot_window.transient(root) # Make it appear on top of the main window
+    chatbot_window.grab_set() # Make it modal (user must interact with it)
+
+    # Chat display area
+    chat_display = tk.Text(chatbot_window, wrap='word', state='disabled', font=("Arial", 10), bd=2, relief="groove")
+    chat_display.pack(padx=10, pady=10, fill="both", expand=True)
+
+    # Scrollbar for chat display
+    chat_scrollbar = tk.Scrollbar(chat_display, command=chat_display.yview)
+    chat_display.config(yscrollcommand=chat_scrollbar.set)
+    chat_scrollbar.pack(side="right", fill="y")
+
+    # Input frame
+    input_frame = tk.Frame(chatbot_window)
+    input_frame.pack(padx=10, pady=(0, 10), fill="x")
+
+    user_input = tk.Entry(input_frame, font=("Arial", 10), relief="solid", bd=1)
+    user_input.pack(side="left", fill="x", expand=True, padx=(0, 5))
+
+    send_button = tk.Button(input_frame, text="Send", font=("Arial", 10, "bold"), bg="#4CAF50", fg="white")
+    send_button.pack(side="right")
+
+    # Loading indicator
+    loading_label = tk.Label(chatbot_window, text="AI is thinking...", fg="gray", font=("Arial", 9, "italic"))
+    loading_label.pack(pady=5)
+    loading_label.pack_forget() # Hide initially
+
+    def display_message(sender, message, is_link=False, link_url=None):
+        chat_display.config(state='normal')
+        if is_link:
+            chat_display.insert(tk.END, f"{sender}: {message}\n")
+            chat_display.insert(tk.END, f"🔗 {link_url}\n", "link")
+            chat_display.tag_config("link", foreground="blue", underline=True)
+            chat_display.tag_bind("link", "<Button-1>", lambda e: webbrowser.open_new_tab(link_url))
+            chat_display.insert(tk.END, "\n") # Add extra newline after link
+        else:
+            chat_display.insert(tk.END, f"{sender}: {message}\n\n")
+        chat_display.yview(tk.END) # Scroll to bottom
+        chat_display.config(state='disabled')
+
+    def retrieve_context(query):
+        """
+        Retrieves relevant context from the producers database based on keywords in the query.
+        This simulates the "learning from stored data" aspect.
+        """
+        # Simple keyword extraction (can be enhanced with NLP libraries)
+        keywords = re.findall(r'\b\w+\b', query.lower())
+        # Filter out common stop words if necessary for more precise search
+        stop_words = {"what", "is", "are", "tell", "me", "about", "who", "which", "show", "list", "of", "the", "a", "an", "find"}
+        filtered_keywords = [word for word in keywords if word not in stop_words and len(word) > 2]
+
+        context_data = []
+        try:
+            temp_conn = sqlite3.connect(DB_FILE)
+            temp_cursor = temp_conn.cursor()
+
+            # Build a dynamic query to search across relevant columns
+            sql_parts = []
+            params = []
+            for kw in filtered_keywords:
+                sql_parts.append("name LIKE ? OR products LIKE ? OR category LIKE ?")
+                params.extend([f"%{kw}%", f"%{kw}%", f"%{kw}%"])
+
+            if sql_parts:
+                query_sql = "SELECT name, products, category FROM producers WHERE " + " OR ".join(sql_parts) + " LIMIT 5" # Limit results for concise context
+                temp_cursor.execute(query_sql, params)
+                rows = temp_cursor.fetchall()
+                
+                if rows:
+                    context_data.append("Relevant producer information from the database:")
+                    for row in rows:
+                        # Format each relevant row into a readable string
+                        context_data.append(f"- Name: {row[0]}, Products: {row[1] if row[1] else 'N/A'}, Category: {row[2] if row[2] else 'N/A'}")
+                
+            temp_conn.close()
+
+        except Exception as e:
+            print(f"Error fetching producer data for context: {e}")
+            context_data.append("An error occurred while trying to retrieve information from the database.")
+
+        # Always include some general information about the DB if no specific data is found
+        if not context_data or len(context_data) == 0: # Ensure context_data is not empty
+            context_data.append("No specific producer data found in the database for your query.")
+        
+        context_data.append("\nGeneral information about GlobalEnergyDB: This project aims to centralize data on global energy production, consumption, and reserves. It includes details on producers and their products (e.g., solar, wind, oil, gas).")
+        
+        # Conceptual placeholder for "learning from searches"
+        # Removed the "Note on learning from past searches" as it's not a core function for the chatbot's direct response.
+
+        return "\n".join(context_data)
+
+
+    def send_chat_message_thread():
+        query = user_input.get().strip()
+        if not query:
+            return
+
+        display_message("You", query)
+        user_input.delete(0, tk.END)
+        loading_label.pack() # Show loading indicator
+        send_button.config(state='disabled') # Disable button
+
+        def process_chat_response():
+            try:
+                context = retrieve_context(query)
+                print(f"Context provided to LLM:\n{context}\n---") # For debugging
+                response_text = gemini_chat_response(query, context)
+
+                # Check for web search suggestion tag
+                match = re.search(r'\[WEB_SEARCH_SUGGESTION:\s*(.*?)\s*\]', response_text)
+                if match:
+                    suggested_query = match.group(1).strip()
+                    google_url = f"https://www.google.com/search?q={quote(suggested_query)}"
+                    
+                    # Clean the response text by removing the tag
+                    clean_response_text = response_text.replace(match.group(0), "").strip()
+                    if not clean_response_text:
+                        clean_response_text = f"I couldn't find a direct answer, but I've opened a web search for '{suggested_query}' for you."
+                    
+                    display_message("Bot", clean_response_text, is_link=True, link_url=google_url)
+                    webbrowser.open_new_tab(google_url)
+                else:
+                    display_message("Bot", response_text)
+
+            except Exception as e:
+                display_message("Bot", f"An error occurred: {e}")
+            finally:
+                loading_label.pack_forget() # Hide loading indicator
+                send_button.config(state='normal') # Re-enable button
+
+        # Run the AI call in a separate thread
+        threading.Thread(target=process_chat_response).start()
+
+    send_button.config(command=send_chat_message_thread)
+    user_input.bind("<Return>", lambda event: send_chat_message_thread()) # Allow Enter key to send
+
+    # Initial bot message
+    display_message("Bot", "Hello! I'm your GlobalEnergyDB chatbot. I can answer questions based on the producers data stored in this application. If I can't find it, I might suggest an online search. How can I assist you today?")
+
+    # Center the chatbot window
+    chatbot_window.update_idletasks()
+    x = root.winfo_x() + (root.winfo_width() // 2) - (chatbot_window.winfo_width() // 2)
+    y = root.winfo_y() + (root.winfo_height() // 2) - (chatbot_window.winfo_height() // 2)
+    chatbot_window.geometry(f"+{x}+{y}")
+
+
 # --- GUI Layout ---
 
 root = tk.Tk()
 root.title("Global Energy Producers Database") # Updated title
-root.geometry("1200x600") # Adjusted size since spares section is removed
+root.geometry("1200x700") # Adjusted size to accommodate new button
 
 # Create a main frame to hold everything
 main_frame = tk.Frame(root)
@@ -628,7 +1049,7 @@ btn_add = tk.Button(button_frame_producers, text="Add Producer", command=add_pro
 btn_add.pack(side="left", padx=5)
 btn_update = tk.Button(button_frame_producers, text="Update Selected", command=update_producer)
 btn_update.pack(side="left", padx=5)
-btn_delete = tk.Button(button_frame_producers, text="Delete Selected", command=delete_producer)
+btn_delete = tk.Button(button_frame_producers, text="Delete Selected (AI Confirm)", command=delete_producer) # Updated button
 btn_delete.pack(side="left", padx=5)
 btn_clear = tk.Button(button_frame_producers, text="Clear Fields", command=clear_producer_fields)
 btn_clear.pack(side="left", padx=5)
@@ -640,10 +1061,11 @@ search_frame_producers = tk.LabelFrame(producers_section, text="Search & Import 
 search_frame_producers.pack(pady=5, padx=10, fill="x")
 
 # ... Producer search and import
+tk.Label(search_frame_producers, text="Search:").pack(side="left", padx=(0,5))
 entry_search = tk.Entry(search_frame_producers, width=40)
 entry_search.pack(side="left", padx=5)
+tk.Label(search_frame_producers, text="By:").pack(side="left", padx=(0,5))
 search_by_combobox = ttk.Combobox(search_frame_producers, values=["Name", "Category"], state="readonly", width=10)
-search_by_combobox.set("Name")
 search_by_combobox.pack(side="left", padx=5)
 btn_search = tk.Button(search_frame_producers, text="Search", command=search_producers)
 btn_search.pack(side="left", padx=5)
@@ -659,7 +1081,7 @@ tree_frame_producers.pack(fill="both", expand=True, padx=10, pady=10)
 
 tree_scroll_producers = ttk.Scrollbar(tree_frame_producers)
 tree_scroll_producers.pack(side="right", fill="y")
-tree_producers = ttk.Treeview(tree_frame_producers, columns=("ID", "Name", "Contact", "Address", "Products", "Category"), show="headings", yscrollcommand=tree_scroll_producers.set)
+tree_producers = ttk.Treeview(tree_frame_producers, columns=("ID", "Name", "Contact", "Address", "Products", "Category"), show="headings", yscrollcommand=tree_scroll_producers.set, selectmode="browse") # Added selectmode
 tree_scroll_producers.config(command=tree_producers.yview)
 columns_producers = {"ID": 40, "Name": 150, "Contact": 120, "Address": 200, "Products": 150, "Category": 100}
 for col, width in columns_producers.items():
@@ -677,7 +1099,7 @@ global_search_frame.pack(fill="x", padx=10, pady=(0,10))
 tk.Label(global_search_frame, text="AI Web Search Keyword:").pack(side="left", padx=(0,5))
 entry_web_search_keyword = tk.Entry(global_search_frame, width=30)
 entry_web_search_keyword.pack(side="left", padx=5)
-btn_web_search_keyword_general = tk.Button(global_search_frame, text="Search Companies (AI)", command=web_search_product_keyword)
+btn_web_search_keyword_general = tk.Button(global_search_frame, text="Search Companies (Google)", command=web_search_product_keyword)
 btn_web_search_keyword_general.pack(side="left", padx=5)
 
 # Separator
@@ -687,8 +1109,16 @@ ttk.Separator(global_search_frame, orient='vertical').pack(side='left', fill='y'
 tk.Label(global_search_frame, text="File Content Search:").pack(side="left", padx=(0,5))
 btn_upload_pdf = tk.Button(global_search_frame, text="Scan PDF for Suppliers", command=upload_pdf_and_search)
 btn_upload_pdf.pack(side="left", padx=5)
-btn_upload_and_search_any_file = tk.Button(global_search_frame, text="Scan Any File for Products (AI)", command=upload_and_scan_file_for_energy_products)
+btn_upload_and_search_any_file = tk.Button(global_search_frame, text="Scan Any File for Products (Google)", command=upload_and_scan_file_for_energy_products)
 btn_upload_and_search_any_file.pack(side="left", padx=5)
+
+# AI Database Query Button
+btn_ai_db_query = tk.Button(global_search_frame, text="AI Database Query", command=ai_database_query)
+btn_ai_db_query.pack(side="left", padx=(20,5)) # Add some padding from previous group
+
+# NEW: Chatbot Button
+btn_open_chatbot = tk.Button(global_search_frame, text="Open Chatbot", command=open_chatbot_window)
+btn_open_chatbot.pack(side="left", padx=5)
 
 
 # --- Load initial data ---
